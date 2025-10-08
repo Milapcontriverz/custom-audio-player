@@ -77,13 +77,19 @@ public class AudioPlayerPlugin: CAPPlugin {
         
         commandCenter.nextTrackCommand.removeTarget(nil)
         commandCenter.nextTrackCommand.addTarget { [weak self] _ in
-            self?.nextTrack()
+//            self?.nextTrack()
+            self?.runBackgroundSafe {
+                self?.notifyListeners("trackChange", data: ["action": "next"])
+            }
             return .success
         }
         
         commandCenter.previousTrackCommand.removeTarget(nil)
         commandCenter.previousTrackCommand.addTarget { [weak self] _ in
-            self?.previousTrack()
+//            self?.previousTrack()
+            self?.runBackgroundSafe {
+                    self?.notifyListeners("trackChange", data: ["action": "previous"])
+                }
             return .success
         }
         
@@ -506,14 +512,28 @@ public class AudioPlayerPlugin: CAPPlugin {
         call.resolve()
     }
     
-    @objc func next(_ call: CAPPluginCall) {
-        nextTrack()
-        call.resolve()
-    }
+//    @objc func next(_ call: CAPPluginCall) {
+//        nextTrack()
+//        call.resolve()
+//    }
+//    
+//    @objc func previous(_ call: CAPPluginCall) {
+//        previousTrack()
+//        call.resolve()
+//    }
     
+    @objc func next(_ call: CAPPluginCall) {
+        DispatchQueue.main.async {
+            self.notifyListeners("trackChange", data: ["action": "next"])
+            call.resolve()
+        }
+    }
+
     @objc func previous(_ call: CAPPluginCall) {
-        previousTrack()
-        call.resolve()
+        DispatchQueue.main.async {
+            self.notifyListeners("trackChange", data: ["action": "previous"])
+            call.resolve()
+        }
     }
     
     @objc func seekTo(_ call: CAPPluginCall) {
