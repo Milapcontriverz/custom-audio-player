@@ -69,7 +69,7 @@ export interface AudioPlayerPlugin {
   /**
    * Seek to a specific position in the current track
    */
-  seekTo(position: number): Promise<void>;
+  seekTo(position: number | { position: number }): Promise<void>;
 
   /**
    * Set the playback queue
@@ -119,7 +119,7 @@ export interface AudioPlayerPlugin {
   /**
    * Set playback rate
    */
-  setPlaybackRate(rate: number): Promise<void>;
+  setPlaybackRate(options: { rate: number }): Promise<void>;
 
   /**
    * Listen for player state changes

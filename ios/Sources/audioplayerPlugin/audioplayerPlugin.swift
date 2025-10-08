@@ -587,10 +587,15 @@ public class AudioPlayerPlugin: CAPPlugin {
     }
     
     @objc func setPlaybackRate(_ call: CAPPluginCall) {
+
         guard let rate = call.getDouble("rate") else {
+            print("⚡ Rate not provided or invalid")
             call.reject("rate must be provided as number")
             return
         }
+
+        print("⚡ Received playback rate:", rate)
+
         let rateF = Float(rate)
         if let audioPlayer = audioPlayer {
             audioPlayer.enableRate = true

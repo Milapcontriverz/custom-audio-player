@@ -105,7 +105,18 @@ export class AudioPlayerWeb implements AudioPlayerPlugin {
     this.state.volume = Math.max(0, Math.min(1, volume));
   }
 
-  async setPlaybackRate(rate: number): Promise<void> {
+  async setPlaybackRate(rateOrOptions: number | { rate: number }): Promise<void> {
+    let rate: number;
+  
+    if (typeof rateOrOptions === 'number') {
+      rate = rateOrOptions;
+    } else if (rateOrOptions && typeof rateOrOptions.rate === 'number') {
+      rate = rateOrOptions.rate;
+    } else {
+      console.error('Invalid playback rate input:', rateOrOptions);
+      throw new Error('rate must be provided as number');
+    }
+  
     console.log('Web AudioPlayer setPlaybackRate:', rate);
     this.state.playbackRate = rate;
   }
