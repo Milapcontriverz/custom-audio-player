@@ -1,0 +1,30 @@
+import { WebPlugin } from '@capacitor/core';
+import type { AudioTrack, PlayerState, AudioPlayerPlugin } from './definitions';
+export declare class AudioPlayerWeb extends WebPlugin implements AudioPlayerPlugin {
+    private audio;
+    private queue;
+    private currentIndex;
+    private state;
+    initialize(): Promise<void>;
+    prepare(track: AudioTrack): Promise<void>;
+    play(): Promise<void>;
+    pause(): Promise<void>;
+    stop(): Promise<void>;
+    previous(): Promise<void>;
+    next(): Promise<void>;
+    seekTo(position: number): Promise<void>;
+    setQueue(tracks: AudioTrack[]): Promise<void>;
+    addTracks(tracks: AudioTrack[]): Promise<void>;
+    removeTrack(trackId: string): Promise<void>;
+    clearQueue(): Promise<void>;
+    getQueue(): Promise<AudioTrack[]>;
+    getPlayerState(): Promise<PlayerState>;
+    setRepeatMode(mode: 'none' | 'one' | 'all'): Promise<void>;
+    setShuffleMode(enabled: boolean): Promise<void>;
+    setVolume(volume: number): Promise<void>;
+    setPlaybackRate(rate: number): Promise<void>;
+    private loadCurrentTrack;
+    private setupEventListeners;
+    private shuffleQueue;
+    private notifyStateChange;
+}

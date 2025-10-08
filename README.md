@@ -5,7 +5,7 @@ This is music player plugin
 ## Install
 
 ```bash
-npm install audio-player
+npm i capacitor-audio-player-demo
 npx cap sync
 ```
 
