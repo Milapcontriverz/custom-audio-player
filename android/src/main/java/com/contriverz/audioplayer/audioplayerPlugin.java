@@ -1,42 +1,41 @@
 package com.contriverz.audioplayer;
 
-import android.app.Notification;
 import android.app.NotificationChannel;
 import android.app.NotificationManager;
-import android.app.PendingIntent;
 import android.content.Context;
-import android.content.Intent;
 import android.graphics.Bitmap;
 import android.graphics.BitmapFactory;
 import android.media.AudioAttributes;
-import android.media.AudioManager;
 import android.media.MediaPlayer;
 import android.os.Build;
 import android.os.Handler;
 import android.os.Looper;
 
-import androidx.annotation.RequiresApi;
-import androidx.core.app.NotificationCompat;
+import androidx.core.app.ActivityCompat;
 import androidx.core.app.NotificationManagerCompat;
+import androidx.core.content.ContextCompat;
 import androidx.media.app.NotificationCompat.MediaStyle;
-
-import com.getcapacitor.JSObject;
-import com.getcapacitor.Plugin;
-import com.getcapacitor.PluginCall;
-import com.getcapacitor.PluginMethod;
-import com.getcapacitor.annotation.CapacitorPlugin;
-
 import android.support.v4.media.MediaMetadataCompat;
 import android.support.v4.media.session.MediaSessionCompat;
 import android.support.v4.media.session.PlaybackStateCompat;
 
-import java.io.IOException;
+import com.getcapacitor.JSObject;
+import com.getcapacitor.Plugin;
+import com.getcapacitor.PluginCall;
+import com.getcapacitor.annotation.CapacitorPlugin;
+import com.getcapacitor.PluginMethod;
+
 import java.io.InputStream;
 import java.net.HttpURLConnection;
 import java.net.URL;
 import java.util.ArrayList;
-import java.util.Collections;
 import java.util.List;
+
+import android.Manifest;
+import android.content.pm.PackageManager;
+import androidx.core.app.NotificationCompat;
+import androidx.core.app.NotificationManagerCompat;
+import androidx.media.app.NotificationCompat.MediaStyle; // for media notification style
 
 @CapacitorPlugin(name = "AudioPlayer")
 public class AudioPlayerPlugin extends Plugin {
@@ -69,7 +68,7 @@ public class AudioPlayerPlugin extends Plugin {
         stateUpdateRunnable = new Runnable() {
             @Override
             public void run() {
-                notifyStateChange();
+                notifyPlayerStateChange();
                 handler.postDelayed(this, 1000);
             }
         };
@@ -85,34 +84,17 @@ public class AudioPlayerPlugin extends Plugin {
 
         mediaSession.setCallback(new MediaSessionCompat.Callback() {
             @Override
-            public void onPlay() {
-                play(null);
-            }
-
+            public void onPlay() { play(null); }
             @Override
-            public void onPause() {
-                pause(null);
-            }
-
+            public void onPause() { pause(null); }
             @Override
-            public void onStop() {
-                stop(null);
-            }
-
+            public void onStop() { stop(null); }
             @Override
-            public void onSkipToNext() {
-                next(null);
-            }
-
+            public void onSkipToNext() { notifyListeners("trackChange", new JSObject().put("action", "next")); }
             @Override
-            public void onSkipToPrevious() {
-                previous(null);
-            }
-
+            public void onSkipToPrevious() { notifyListeners("trackChange", new JSObject().put("action", "previous")); }
             @Override
-            public void onSeekTo(long pos) {
-                seekTo(new PluginCall(getBridge(), "seekTo", new JSObject().put("position", pos), null));
-            }
+            public void onSeekTo(long pos) { seekToPosition((int) pos); }
         });
 
         mediaSession.setActive(true);
@@ -120,15 +102,25 @@ public class AudioPlayerPlugin extends Plugin {
 
     private void createNotificationChannel() {
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-            NotificationChannel channel = new NotificationChannel(
-                    CHANNEL_ID,
-                    "Audio Player",
-                    NotificationManager.IMPORTANCE_LOW
-            );
+            NotificationChannel channel = new NotificationChannel(CHANNEL_ID, "Audio Player", NotificationManager.IMPORTANCE_LOW);
             channel.setDescription("Audio playback controls");
+            NotificationManager manager = getContext().getSystemService(NotificationManager.class);
+            manager.createNotificationChannel(channel);
+        }
+    }
 
-            NotificationManager notificationManager = getContext().getSystemService(NotificationManager.class);
-            notificationManager.createNotificationChannel(channel);
+    private boolean hasNotificationPermission() {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+            return ContextCompat.checkSelfPermission(getContext(), Manifest.permission.POST_NOTIFICATIONS) == PackageManager.PERMISSION_GRANTED;
+        }
+        return true;
+    }
+
+    private void requestNotificationPermission() {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+            if (!hasNotificationPermission()) {
+                ActivityCompat.requestPermissions(getActivity(), new String[]{Manifest.permission.POST_NOTIFICATIONS}, 101);
+            }
         }
     }
 
@@ -137,32 +129,68 @@ public class AudioPlayerPlugin extends Plugin {
         try {
             if (mediaPlayer == null) {
                 mediaPlayer = new MediaPlayer();
-                mediaPlayer.setAudioStreamType(AudioManager.STREAM_MUSIC);
+                mediaPlayer.setAudioAttributes(
+                        new AudioAttributes.Builder()
+                                .setUsage(AudioAttributes.USAGE_MEDIA)
+                                .setContentType(AudioAttributes.CONTENT_TYPE_MUSIC)
+                                .build()
+                );
                 setupMediaPlayerListeners();
             }
             call.resolve();
-        } catch (Exception e) {
-            call.reject("Failed to initialize player: " + e.getMessage());
-        }
+        } catch (Exception e) { call.reject("Failed to initialize player: " + e.getMessage()); }
     }
 
     @PluginMethod
     public void prepare(PluginCall call) {
         try {
+            // Case 1: Single track inside "track"
             JSObject trackData = call.getObject("track");
-            if (trackData == null) {
-                call.reject("Track data is required");
+            if (trackData != null) {
+                AudioTrack track = parseTrack(trackData);
+                trackQueue.clear();
+                trackQueue.add(track);
+                currentIndex = 0;
+                loadCurrentTrack();
+                call.resolve();
                 return;
             }
 
-            AudioTrack track = parseTrack(trackData);
-            trackQueue.clear();
-            trackQueue.add(track);
-            currentIndex = 0;
+            // Case 2: Multiple tracks inside "tracks"
+            JSObject tracksArrayObj = call.getObject("tracks");
+            if (tracksArrayObj != null) {
+                // convert JSObject array to List<JSObject>
+                List<Object> tracksList = call.getArray("tracks").toList();
+                if (tracksList.isEmpty()) {
+                    call.reject("Invalid tracks array");
+                    return;
+                }
+                trackQueue.clear();
+                for (Object obj : tracksList) {
+                    if (obj instanceof JSObject) {
+                        trackQueue.add(parseTrack((JSObject) obj));
+                    }
+                }
+                currentIndex = 0;
+                loadCurrentTrack();
+                call.resolve();
+                return;
+            }
 
-            loadCurrentTrack();
+            // Case 3: Track data directly in options
+            JSObject options = call.getData();
+            if (options != null && options.getString("id") != null && options.getString("url") != null) {
+                AudioTrack track = parseTrack(options);
+                trackQueue.clear();
+                trackQueue.add(track);
+                currentIndex = 0;
+                loadCurrentTrack();
+                call.resolve();
+                return;
+            }
 
-            call.resolve();
+            // If none of the above matched
+            call.reject("Track data is required");
         } catch (Exception e) {
             call.reject("Failed to prepare track: " + e.getMessage());
         }
@@ -178,9 +206,7 @@ public class AudioPlayerPlugin extends Plugin {
                 updateNotification();
             }
             call.resolve();
-        } catch (Exception e) {
-            call.reject("Failed to play: " + e.getMessage());
-        }
+        } catch (Exception e) { call.reject("Failed to play: " + e.getMessage()); }
     }
 
     @PluginMethod
@@ -193,157 +219,32 @@ public class AudioPlayerPlugin extends Plugin {
                 updateNotification();
             }
             call.resolve();
-        } catch (Exception e) {
-            call.reject("Failed to pause: " + e.getMessage());
-        }
+        } catch (Exception e) { call.reject("Failed to pause: " + e.getMessage()); }
     }
 
     @PluginMethod
     public void stop(PluginCall call) {
         try {
             if (mediaPlayer != null) {
-                mediaPlayer.stop();
-                mediaPlayer.seekTo(0);
-                stopPeriodicUpdates();
-                updatePlaybackState();
-                updateNotification();
+                mediaPlayer.stop(); mediaPlayer.seekTo(0);
+                stopPeriodicUpdates(); updatePlaybackState(); updateNotification();
             }
             call.resolve();
-        } catch (Exception e) {
-            call.reject("Failed to stop: " + e.getMessage());
-        }
+        } catch (Exception e) { call.reject("Failed to stop: " + e.getMessage()); }
     }
 
     @PluginMethod
-    public void next(PluginCall call) {
-        try {
-            if (shuffleMode) {
-                currentIndex = (int) (Math.random() * trackQueue.size());
-            } else {
-                if (currentIndex < trackQueue.size() - 1) {
-                    currentIndex++;
-                } else if ("all".equals(repeatMode)) {
-                    currentIndex = 0;
-                } else {
-                    stop(null);
-                    call.resolve();
-                    return;
-                }
-            }
-            loadCurrentTrack();
-            call.resolve();
-        } catch (Exception e) {
-            call.reject("Failed to go to next track: " + e.getMessage());
-        }
-    }
-
+    public void next(PluginCall call) { notifyListeners("trackChange", new JSObject().put("action", "next")); call.resolve(); }
     @PluginMethod
-    public void previous(PluginCall call) {
-        try {
-            int currentPos = mediaPlayer != null ? mediaPlayer.getCurrentPosition() : 0;
-            if (currentPos > 3000) {
-                seekToPosition(0);
-                call.resolve();
-                return;
-            }
-            if (currentIndex > 0) {
-                currentIndex--;
-            } else if ("all".equals(repeatMode)) {
-                currentIndex = trackQueue.size() - 1;
-            } else {
-                seekToPosition(0);
-                call.resolve();
-                return;
-            }
-            loadCurrentTrack();
-            call.resolve();
-        } catch (Exception e) {
-            call.reject("Failed to go to previous track: " + e.getMessage());
-        }
-    }
+    public void previous(PluginCall call) { notifyListeners("trackChange", new JSObject().put("action", "previous")); call.resolve(); }
 
     @PluginMethod
     public void seekTo(PluginCall call) {
         try {
             Double pos = call.getDouble("position");
-            if (pos != null) {
-                seekToPosition(pos.intValue());
-            }
+            if (pos != null) seekToPosition((int) (pos * 1000));
             call.resolve();
-        } catch (Exception e) {
-            call.reject("Failed to seek: " + e.getMessage());
-        }
-    }
-
-    @PluginMethod
-    public void setQueue(PluginCall call) {
-        try {
-            List<Object> tracks = call.getArray("tracks");
-            if (tracks != null) {
-                trackQueue.clear();
-                for (Object obj : tracks) {
-                    if (obj instanceof JSObject) {
-                        trackQueue.add(parseTrack((JSObject) obj));
-                    }
-                }
-                currentIndex = 0;
-                loadCurrentTrack();
-            }
-            call.resolve();
-        } catch (Exception e) {
-            call.reject("Failed to set queue: " + e.getMessage());
-        }
-    }
-
-    @PluginMethod
-    public void setRepeatMode(PluginCall call) {
-        String mode = call.getString("mode");
-        if (mode != null) repeatMode = mode;
-        notifyStateChange();
-        call.resolve();
-    }
-
-    @PluginMethod
-    public void setShuffleMode(PluginCall call) {
-        Boolean enabled = call.getBoolean("shuffle");
-        if (enabled != null) shuffleMode = enabled;
-        if (shuffleMode) Collections.shuffle(trackQueue);
-        notifyStateChange();
-        call.resolve();
-    }
-
-    @PluginMethod
-    public void setVolume(PluginCall call) {
-        Double vol = call.getDouble("volume");
-        if (vol != null && mediaPlayer != null) {
-            float fvol = vol.floatValue();
-            mediaPlayer.setVolume(fvol, fvol);
-        }
-        notifyStateChange();
-        call.resolve();
-    }
-
-    @PluginMethod
-    public void setPlaybackRate(PluginCall call) {
-        Double rate = call.getDouble("rate");
-        if (rate != null && mediaPlayer != null && Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
-            mediaPlayer.setPlaybackParams(mediaPlayer.getPlaybackParams().setSpeed(rate.floatValue()));
-        }
-        call.resolve();
-    }
-
-    @PluginMethod
-    public void getState(PluginCall call) {
-        JSObject state = new JSObject();
-        state.put("isPlaying", mediaPlayer != null && mediaPlayer.isPlaying());
-        state.put("position", mediaPlayer != null ? mediaPlayer.getCurrentPosition() : 0);
-        state.put("duration", mediaPlayer != null ? mediaPlayer.getDuration() : 0);
-        state.put("repeatMode", repeatMode);
-        state.put("shuffleMode", shuffleMode);
-        state.put("volume", mediaPlayer != null ? 1.0 : 0.0);
-        state.put("currentTrack", currentIndex < trackQueue.size() ? serializeTrack(trackQueue.get(currentIndex)) : null);
-        state.put("lastError", lastError != null ? lastError : "");
-        call.resolve(state);
+        } catch (Exception e) { call.reject("Failed to seek: " + e.getMessage()); }
     }
 
     private void loadCurrentTrack() {
@@ -355,61 +256,46 @@ public class AudioPlayerPlugin extends Plugin {
                 mediaPlayer.setDataSource(track.getUrl());
                 mediaPlayer.prepareAsync();
                 mediaPlayer.setOnPreparedListener(mp -> {
-                    updateMetadata(track);
-                    notifyTrackChange(track);
-                    play(null);
+                    updateMetadata(track); notifyTrackChange(track); play(null);
                 });
             }
-        } catch (IOException e) {
-            lastError = e.getMessage();
-            notifyError(e.getMessage());
-        }
+        } catch (Exception e) { lastError = e.getMessage(); notifyError(e.getMessage()); }
     }
 
-    private void seekToPosition(int pos) {
-        if (mediaPlayer != null) {
-            mediaPlayer.seekTo(pos);
-        }
-        notifyStateChange();
+    private void updateMetadata(AudioTrack track) {
+        if (mediaSession == null) return;
+        MediaMetadataCompat.Builder metadata = new MediaMetadataCompat.Builder();
+        metadata.putString(MediaMetadataCompat.METADATA_KEY_TITLE, track.getTitle());
+        metadata.putString(MediaMetadataCompat.METADATA_KEY_ARTIST, track.getArtist());
+        metadata.putString(MediaMetadataCompat.METADATA_KEY_ALBUM, track.getAlbum() != null ? track.getAlbum() : "");
+        if (track.getDuration() != null) metadata.putLong(MediaMetadataCompat.METADATA_KEY_DURATION, track.getDuration().longValue());
+        mediaSession.setMetadata(metadata.build());
     }
 
-    private void startPeriodicUpdates() {
-        handler.post(stateUpdateRunnable);
-    }
-
-    private void stopPeriodicUpdates() {
-        handler.removeCallbacks(stateUpdateRunnable);
-    }
+    private void seekToPosition(int posMs) { if (mediaPlayer != null) mediaPlayer.seekTo(posMs); notifyPlayerStateChange(); }
+    private void startPeriodicUpdates() { handler.post(stateUpdateRunnable); }
+    private void stopPeriodicUpdates() { handler.removeCallbacks(stateUpdateRunnable); }
 
     private void setupMediaPlayerListeners() {
         if (mediaPlayer == null) return;
-
         mediaPlayer.setOnCompletionListener(mp -> {
-            if ("one".equals(repeatMode)) {
-                mp.seekTo(0);
-                mp.start();
-            } else {
-                next(null);
-            }
+            if ("one".equals(repeatMode)) { mp.seekTo(0); mp.start(); }
+            else next(null);
             notifyListeners("playbackEnd", new JSObject());
         });
-
-        mediaPlayer.setOnErrorListener((mp, what, extra) -> {
-            lastError = "MediaPlayer error: " + what;
-            notifyError(lastError);
-            return true;
-        });
+        mediaPlayer.setOnErrorListener((mp, what, extra) -> { lastError = "MediaPlayer error: " + what; notifyError(lastError); return true; });
     }
 
     private void updatePlaybackState() {
         if (mediaSession == null) return;
         int state = mediaPlayer != null && mediaPlayer.isPlaying() ? PlaybackStateCompat.STATE_PLAYING : PlaybackStateCompat.STATE_PAUSED;
+        int posMs = mediaPlayer != null ? mediaPlayer.getCurrentPosition() : 0;
         PlaybackStateCompat.Builder stateBuilder = new PlaybackStateCompat.Builder()
                 .setActions(PlaybackStateCompat.ACTION_PLAY_PAUSE |
                         PlaybackStateCompat.ACTION_SKIP_TO_NEXT |
                         PlaybackStateCompat.ACTION_SKIP_TO_PREVIOUS |
                         PlaybackStateCompat.ACTION_SEEK_TO)
-                .setState(state, mediaPlayer != null ? mediaPlayer.getCurrentPosition() : 0, 1.0f);
+                .setState(state, posMs, 1.0f);
         mediaSession.setPlaybackState(stateBuilder.build());
     }
 
@@ -417,10 +303,7 @@ public class AudioPlayerPlugin extends Plugin {
         if (mediaSession == null || currentIndex >= trackQueue.size()) return;
 
         AudioTrack track = trackQueue.get(currentIndex);
-        Bitmap artwork = null;
-        if (track.getArtwork() != null) {
-            artwork = getBitmapFromURL(track.getArtwork());
-        }
+        Bitmap artwork = track.getArtwork() != null ? getBitmapFromURL(track.getArtwork()) : null;
 
         NotificationCompat.Builder builder = new NotificationCompat.Builder(getContext(), CHANNEL_ID)
                 .setContentTitle(track.getTitle())
@@ -431,20 +314,26 @@ public class AudioPlayerPlugin extends Plugin {
                 .setOnlyAlertOnce(true)
                 .setStyle(new MediaStyle().setMediaSession(mediaSession.getSessionToken()));
 
-        NotificationManagerCompat.from(getContext()).notify(NOTIFICATION_ID, builder.build());
+        NotificationManagerCompat manager = NotificationManagerCompat.from(getContext());
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+            // For Android 13+, request notification permission
+            if (getContext().checkSelfPermission(android.Manifest.permission.POST_NOTIFICATIONS) !=
+                    android.content.pm.PackageManager.PERMISSION_GRANTED) {
+                return; // permission not granted
+            }
+        }
+        manager.notify(NOTIFICATION_ID, builder.build());
     }
 
-    private void notifyTrackChange(AudioTrack track) {
-        JSObject data = new JSObject();
-        data.put("track", serializeTrack(track));
-        notifyListeners("trackChange", data);
-    }
-
-    private void notifyStateChange() {
+    private void notifyPlayerStateChange() {
         JSObject state = new JSObject();
-        state.put("isPlaying", mediaPlayer != null && mediaPlayer.isPlaying());
-        state.put("position", mediaPlayer != null ? mediaPlayer.getCurrentPosition() : 0);
-        state.put("duration", mediaPlayer != null ? mediaPlayer.getDuration() : 0);
+        boolean isPlaying = mediaPlayer != null && mediaPlayer.isPlaying();
+        int posMs = mediaPlayer != null ? mediaPlayer.getCurrentPosition() : 0;
+        int durationMs = mediaPlayer != null ? mediaPlayer.getDuration() : 0;
+
+        state.put("isPlaying", isPlaying);
+        state.put("position", Math.round(posMs / 1000.0));
+        state.put("duration", Math.round(durationMs / 1000.0));
         state.put("repeatMode", repeatMode);
         state.put("shuffleMode", shuffleMode);
         state.put("volume", mediaPlayer != null ? 1.0 : 0.0);
@@ -453,11 +342,8 @@ public class AudioPlayerPlugin extends Plugin {
         notifyListeners("playerStateChange", state);
     }
 
-    private void notifyError(String msg) {
-        JSObject data = new JSObject();
-        data.put("error", msg);
-        notifyListeners("error", data);
-    }
+    private void notifyTrackChange(AudioTrack track) { notifyListeners("trackChange", new JSObject().put("track", serializeTrack(track))); }
+    private void notifyError(String msg) { notifyListeners("error", new JSObject().put("error", msg)); }
 
     private JSObject serializeTrack(AudioTrack track) {
         JSObject obj = new JSObject();
@@ -472,27 +358,28 @@ public class AudioPlayerPlugin extends Plugin {
     }
 
     private AudioTrack parseTrack(JSObject json) {
-        return new AudioTrack(
-                json.getString("id"),
-                json.getString("title"),
-                json.getString("artist"),
-                json.getString("album"),
-                json.getDouble("duration"),
-                json.getString("url"),
-                json.getString("artwork")
-        );
+        String id = json.getString("id") != null ? json.getString("id") : "";
+        String title = json.getString("title") != null ? json.getString("title") : "";
+        String artist = json.getString("artist") != null ? json.getString("artist") : "";
+        String album = json.getString("album") != null ? json.getString("album") : "";
+        String url = json.getString("url") != null ? json.getString("url") : "";
+        String artwork = json.getString("artwork") != null ? json.getString("artwork") : "";
+
+        double duration = 0;
+        try {
+            Object d = json.get("duration");
+            if (d != null) {
+                duration = Double.parseDouble(d.toString());
+            }
+        } catch (Exception e) {
+            duration = 0;
+        }
+
+        return new AudioTrack(id, title, artist, album, duration, url, artwork);
     }
 
     private Bitmap getBitmapFromURL(String src) {
-        try {
-            URL url = new URL(src);
-            HttpURLConnection connection = (HttpURLConnection) url.openConnection();
-            connection.setDoInput(true);
-            connection.connect();
-            InputStream input = connection.getInputStream();
-            return BitmapFactory.decodeStream(input);
-        } catch (Exception e) {
-            return null;
-        }
+        try { URL url = new URL(src); HttpURLConnection conn = (HttpURLConnection) url.openConnection(); conn.setDoInput(true); conn.connect(); InputStream input = conn.getInputStream(); return BitmapFactory.decodeStream(input); }
+        catch (Exception e) { return null; }
     }
 }
