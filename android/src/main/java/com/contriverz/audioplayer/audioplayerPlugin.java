@@ -28,7 +28,6 @@ import com.getcapacitor.PluginMethod;
 import com.google.android.exoplayer2.ExoPlayer;
 import com.google.android.exoplayer2.MediaItem;
 import com.google.android.exoplayer2.Player;
-import com.google.android.exoplayer2.C;
 import java.io.File;
 import java.util.ArrayList;
 import java.util.List;
@@ -43,16 +42,22 @@ public class AudioPlayerPlugin extends Plugin {
     private ExoPlayer exoPlayer;
     private List<AudioTrack> trackQueue = new ArrayList<>();
     private int currentIndex = 0;
-    private String repeatMode = "none"; // none, one, all
+    private String repeatMode = "none";
     private boolean shuffleMode = false;
     private Handler mainHandler;
     private MediaSessionCompat mediaSession;
 
     private long currentPlaybackPosition = 0;
     private boolean isCurrentlyPlaying = false;
+
+    // Add these for better state management
+    private long seekbarPosition = 0;
+    private int lastPlaybackState = PlaybackStateCompat.STATE_PAUSED;
+
     private Handler positionHandler = new Handler(Looper.getMainLooper());
     private Runnable positionRunnable = new Runnable() {
         private long lastSentPosition = -1;
+        private long lastNotificationUpdate = 0;
 
         @Override
         public void run() {
@@ -61,52 +66,57 @@ public class AudioPlayerPlugin extends Plugin {
                 long duration = exoPlayer.getDuration();
 
                 currentPlaybackPosition = position;
+                seekbarPosition = position; // Track for MediaSession
 
-                // Only update if position actually changed (prevents flickering)
-                if (position != lastSentPosition) {
+                boolean isPlaying = exoPlayer.isPlaying();
+
+                // Always update JS side when playing, less frequently when paused
+                boolean shouldUpdateJS = isPlaying || (position != lastSentPosition);
+                if (shouldUpdateJS) {
                     lastSentPosition = position;
 
-                    // Update JS side (convert to seconds)
                     JSObject data = new JSObject();
-                    data.put("isPlaying", exoPlayer.isPlaying());
-                    data.put("position", position / 1000.0); // ms to seconds
+                    data.put("isPlaying", isPlaying);
+                    data.put("position", position / 1000.0);
                     data.put("duration", duration > 0 ? duration / 1000.0 : 0);
                     data.put("trackId", trackQueue.get(currentIndex).getId());
                     notifyListeners("playerStateChange", data);
 
-                    Log.d(TAG, "🔄 Position Update: " + position + "ms");
+                    Log.d(TAG, "🔄 Position: " + position + "ms, Playing: " + isPlaying);
                 }
 
-                // Update MediaSession (keep as milliseconds)
-                updateMediaSessionPosition(position);
+                // Update MediaSession for seekbar - ALWAYS when playing, less when paused
+                if (isPlaying) {
+                    updateMediaSessionPosition(seekbarPosition);
+                } else {
+                    long currentTime = System.currentTimeMillis();
+                    if (currentTime - lastNotificationUpdate > 2000) { // Every 2 seconds when paused
+                        updateMediaSessionPosition(seekbarPosition);
+                        lastNotificationUpdate = currentTime;
+                    }
+                }
 
-                // Update notification (but less frequently to reduce flickering)
-                if (System.currentTimeMillis() % 3000 < 1000) { // Every 3 seconds
+                // Update notification less frequently
+                long currentTime = System.currentTimeMillis();
+                if (currentTime - lastNotificationUpdate > 3000) {
+                    lastNotificationUpdate = currentTime;
                     showNotification(trackQueue.get(currentIndex));
                 }
 
-                positionHandler.postDelayed(this, 1000);
+                // Schedule next update based on play state
+                if (isPlaying) {
+                    positionHandler.postDelayed(this, 500); // Fast updates when playing
+                } else {
+                    positionHandler.postDelayed(this, 1000); // Slow updates when paused
+                }
             }
         }
     };
-
-
-    private void forceNotificationUpdate() {
-        if (!trackQueue.isEmpty() && currentIndex < trackQueue.size()) {
-            showNotification(trackQueue.get(currentIndex));
-        }
-    }
-
 
     @PluginMethod
     public void forcePositionUpdate(PluginCall call) {
         mainHandler.post(() -> {
             if (exoPlayer != null) {
-                long position = exoPlayer.getCurrentPosition();
-                long duration = exoPlayer.getDuration();
-
-                Log.d(TAG, "🔍 FORCE POSITION UPDATE - Position: " + position + "ms, Duration: " + duration + "ms");
-
                 sendPlayerState();
                 call.resolve();
             } else {
@@ -115,14 +125,13 @@ public class AudioPlayerPlugin extends Plugin {
         });
     }
 
-
     private void updateMediaSessionPosition(long position) {
         if (mediaSession == null || exoPlayer == null) return;
 
         boolean isPlaying = exoPlayer.isPlaying();
         int state = isPlaying ? PlaybackStateCompat.STATE_PLAYING : PlaybackStateCompat.STATE_PAUSED;
+        this.lastPlaybackState = state;
 
-        // Get duration
         long duration = exoPlayer.getDuration();
         if (duration <= 0 && !trackQueue.isEmpty()) {
             AudioTrack track = trackQueue.get(currentIndex);
@@ -131,10 +140,14 @@ public class AudioPlayerPlugin extends Plugin {
             }
         }
         if (duration <= 0) {
-            duration = 180000; // 3 minutes fallback
+            duration = 180000;
         }
 
-        // SIMPLE: Just update the position - Android handles the seekbar
+        long bufferedPosition = exoPlayer.getBufferedPosition();
+        if (bufferedPosition <= position) {
+            bufferedPosition = duration;
+        }
+
         PlaybackStateCompat.Builder stateBuilder = new PlaybackStateCompat.Builder()
                 .setActions(
                         PlaybackStateCompat.ACTION_PLAY |
@@ -144,12 +157,10 @@ public class AudioPlayerPlugin extends Plugin {
                                 PlaybackStateCompat.ACTION_SKIP_TO_PREVIOUS |
                                 PlaybackStateCompat.ACTION_SEEK_TO
                 )
-                .setState(state, position, 1.0f, System.currentTimeMillis())
-                .setBufferedPosition(duration);
+                .setState(state, position, isPlaying ? 1.0f : 0f, System.currentTimeMillis())
+                .setBufferedPosition(bufferedPosition);
 
         mediaSession.setPlaybackState(stateBuilder.build());
-
-        Log.d(TAG, "📡 MediaSession Position: " + position + "ms");
     }
 
     private void updateMediaMetadata() {
@@ -157,36 +168,17 @@ public class AudioPlayerPlugin extends Plugin {
 
         AudioTrack track = trackQueue.get(currentIndex);
 
-        // Get duration
         long duration = exoPlayer != null ? exoPlayer.getDuration() : 0;
         long finalDuration = duration > 0 ? duration :
                 (track.getDuration() > 0 ? (long)(track.getDuration() * 1000) : 180000);
 
-        // CRITICAL: Build complete metadata
         MediaMetadataCompat.Builder metadataBuilder = new MediaMetadataCompat.Builder()
                 .putString(MediaMetadataCompat.METADATA_KEY_TITLE, track.getTitle())
                 .putString(MediaMetadataCompat.METADATA_KEY_ARTIST, track.getArtist())
                 .putString(MediaMetadataCompat.METADATA_KEY_ALBUM, track.getAlbum())
-                .putString(MediaMetadataCompat.METADATA_KEY_ALBUM_ARTIST, track.getArtist())
-                .putLong(MediaMetadataCompat.METADATA_KEY_DURATION, finalDuration)
-                .putLong(MediaMetadataCompat.METADATA_KEY_TRACK_NUMBER, (long) (currentIndex + 1))
-                .putLong(MediaMetadataCompat.METADATA_KEY_NUM_TRACKS, (long) trackQueue.size());
+                .putLong(MediaMetadataCompat.METADATA_KEY_DURATION, finalDuration);
 
         mediaSession.setMetadata(metadataBuilder.build());
-
-        Log.d(TAG, "📀 Metadata Updated - Duration: " + finalDuration + "ms");
-    }
-
-    @PluginMethod
-    public void resetMediaSession(PluginCall call) {
-        mainHandler.post(() -> {
-            if (mediaSession != null) {
-                mediaSession.setActive(false);
-                mediaSession.setActive(true);
-                Log.d(TAG, "MediaSession reset");
-            }
-            call.resolve();
-        });
     }
 
     @Override
@@ -198,48 +190,41 @@ public class AudioPlayerPlugin extends Plugin {
         exoPlayer.addListener(new Player.Listener() {
             @Override
             public void onPlaybackStateChanged(int state) {
-                Log.d(TAG, "🎵 onPlaybackStateChanged: " + state +
-                        " [IDLE=1, BUFFERING=2, READY=3, ENDED=4]");
+                Log.d(TAG, "🎵 PlaybackState: " + state);
 
                 switch (state) {
                     case Player.STATE_READY:
-                        long duration = exoPlayer.getDuration();
-                        Log.d(TAG, "🎵 Player is READY, duration: " + duration + "ms");
-
-                        // CRITICAL: Update metadata when duration becomes available
-                        if (duration > 0) {
+                        if (exoPlayer.getDuration() > 0) {
                             updateMediaMetadata();
                         }
                         break;
-                    case Player.STATE_BUFFERING:
-                        Log.d(TAG, "🎵 Player is BUFFERING");
-                        break;
                     case Player.STATE_ENDED:
-                        Log.d(TAG, "🎵 Track ENDED");
                         handleTrackCompletion();
-                        break;
-                    case Player.STATE_IDLE:
-                        Log.d(TAG, "🎵 Player is IDLE");
                         break;
                 }
             }
 
             @Override
             public void onIsPlayingChanged(boolean playing) {
-                Log.d(TAG, "🎵 onIsPlayingChanged: " + playing);
+                Log.d(TAG, "🎵 IsPlayingChanged: " + playing);
                 isCurrentlyPlaying = playing;
 
-                // DON'T update position here - let positionRunnable handle it
-                // Just update the MediaSession state
+                // Force immediate updates when play state changes
                 mainHandler.post(() -> {
-                    updateMediaSessionPosition(exoPlayer.getCurrentPosition());
+                    long position = exoPlayer.getCurrentPosition();
+                    seekbarPosition = position;
+                    updateMediaSessionPosition(position);
+                    sendPlayerState();
+                    if (!trackQueue.isEmpty()) {
+                        showNotification(trackQueue.get(currentIndex));
+                    }
                 });
             }
 
             @Override
             public void onPlayerError(@NonNull com.google.android.exoplayer2.PlaybackException error) {
                 Log.e(TAG, "🎵 Player error: " + error.getMessage());
-                notifyError("ExoPlayer error: " + error.getMessage());
+                notifyError("Playback error: " + error.getMessage());
             }
         });
 
@@ -247,44 +232,9 @@ public class AudioPlayerPlugin extends Plugin {
         createNotificationChannel();
     }
 
-    @PluginMethod
-    public void getPlayerState(PluginCall call) {
-        mainHandler.post(() -> {
-            JSObject result = new JSObject();
-            if (exoPlayer != null) {
-                result.put("playbackState", exoPlayer.getPlaybackState());
-                result.put("isPlaying", exoPlayer.isPlaying());
-                result.put("currentPosition", exoPlayer.getCurrentPosition());
-                result.put("duration", exoPlayer.getDuration());
-                result.put("trackCount", trackQueue.size());
-                result.put("currentIndex", currentIndex);
-
-                // Player state constants
-                String stateName;
-                switch (exoPlayer.getPlaybackState()) {
-                    case Player.STATE_IDLE: stateName = "IDLE"; break;
-                    case Player.STATE_BUFFERING: stateName = "BUFFERING"; break;
-                    case Player.STATE_READY: stateName = "READY"; break;
-                    case Player.STATE_ENDED: stateName = "ENDED"; break;
-                    default: stateName = "UNKNOWN";
-                }
-                result.put("playbackStateName", stateName);
-
-                Log.d(TAG, "Player State: " + stateName +
-                        ", Playing: " + exoPlayer.isPlaying() +
-                        ", Position: " + exoPlayer.getCurrentPosition() +
-                        ", Duration: " + exoPlayer.getDuration());
-            } else {
-                result.put("error", "Player is null");
-            }
-            call.resolve(result);
-        });
-    }
-
     private void setupMediaSession() {
         mediaSession = new MediaSessionCompat(getContext(), "AudioPlayerSession");
 
-        // CRITICAL: Set flags for media session
         mediaSession.setFlags(MediaSessionCompat.FLAG_HANDLES_MEDIA_BUTTONS |
                 MediaSessionCompat.FLAG_HANDLES_TRANSPORT_CONTROLS);
 
@@ -317,7 +267,9 @@ public class AudioPlayerPlugin extends Plugin {
             public void onSeekTo(long pos) {
                 Log.d(TAG, "MediaSession: onSeekTo " + pos);
                 if (exoPlayer != null) {
+                    seekbarPosition = pos;
                     exoPlayer.seekTo(pos);
+                    updateMediaSessionPosition(pos);
                     sendPlayerState();
                 }
             }
@@ -332,15 +284,16 @@ public class AudioPlayerPlugin extends Plugin {
             }
         });
 
-        // CRITICAL: Set initial state and activate
         updateMediaSessionPosition(0);
         mediaSession.setActive(true);
-
-        Log.d(TAG, "✅ MediaSession setup for notification seekbar");
     }
 
-
     private AudioTrack parseTrack(JSObject json) {
+        if (json == null) {
+            Log.e(TAG, "parseTrack: JSON is null");
+            return null;
+        }
+
         try {
             String id = json.optString("id", "track-" + System.currentTimeMillis());
             String title = json.optString("title", "Unknown Track");
@@ -349,28 +302,17 @@ public class AudioPlayerPlugin extends Plugin {
             String url = json.optString("url", "");
             String artwork = json.optString("artwork", "");
             double duration = json.optDouble("duration", 0.0);
-            if (url.isEmpty()) return null;
+
+            if (url.isEmpty()) {
+                Log.e(TAG, "parseTrack: URL is empty");
+                return null;
+            }
+
             return new AudioTrack(id, title, artist, album, duration, url, artwork);
         } catch (Exception e) {
             Log.e(TAG, "Track parsing error", e);
             return null;
         }
-    }
-
-    private List<AudioTrack> parseTracks(JSArray array) {
-        List<AudioTrack> tracks = new ArrayList<>();
-        for (int i = 0; i < array.length(); i++) {
-            try {
-                Object item = array.get(i);
-                if (item instanceof JSObject) {
-                    AudioTrack track = parseTrack((JSObject) item);
-                    if (track != null) tracks.add(track);
-                }
-            } catch (Exception e) {
-                Log.e(TAG, "Track array parse error", e);
-            }
-        }
-        return tracks;
     }
 
     @PluginMethod
@@ -379,26 +321,33 @@ public class AudioPlayerPlugin extends Plugin {
             trackQueue.clear();
             currentIndex = 0;
             currentPlaybackPosition = 0;
+            seekbarPosition = 0;
+
             JSObject trackData = call.getObject("track");
             AudioTrack track = null;
-            if (trackData != null) track = parseTrack(trackData);
-            else {
-                try { track = parseTrack(JSObject.fromJSONObject(call.getData())); }
-                catch (Exception e) { Log.e(TAG, "Error parsing track", e); }
+
+            if (trackData != null) {
+                track = parseTrack(trackData);
+            } else {
+                try {
+                    JSObject callData = JSObject.fromJSONObject(call.getData());
+                    if (callData != null) {
+                        track = parseTrack(callData);
+                    }
+                } catch (Exception e) {
+                    Log.e(TAG, "Error parsing track from call data", e);
+                }
             }
 
-            if (track != null) trackQueue.add(track);
-
-            JSArray tracksArray = call.getArray("tracks");
-            if (tracksArray != null && tracksArray.length() > 0) trackQueue.addAll(parseTracks(tracksArray));
-
-            if (trackQueue.isEmpty()) { call.reject("No track data provided"); return; }
-
-            loadCurrentTrack();
-
-            // Don't auto-play here, let the user call play() separately
-            Log.d(TAG, "✅ Prepared track, ready for playback");
-            call.resolve();
+            if (track != null) {
+                trackQueue.add(track);
+                loadCurrentTrack();
+                Log.d(TAG, "✅ Prepared: " + track.getTitle());
+                call.resolve();
+            } else {
+                Log.e(TAG, "❌ No valid track data");
+                call.reject("No valid track data provided");
+            }
         });
     }
 
@@ -410,51 +359,136 @@ public class AudioPlayerPlugin extends Plugin {
 
         AudioTrack track = trackQueue.get(currentIndex);
         try {
-            Log.d(TAG, "🎵 Loading track: " + track.getTitle());
+            Log.d(TAG, "🎵 Loading: " + track.getTitle());
 
             stopPositionUpdates();
             currentPlaybackPosition = 0;
+            seekbarPosition = 0;
 
             exoPlayer.stop();
             exoPlayer.clearMediaItems();
 
-            Uri trackUri = track.getUrl().startsWith("http") ? Uri.parse(track.getUrl()) :
-                    Uri.fromFile(new File(track.getUrl()));
+            Uri trackUri;
+            String url = track.getUrl();
+
+            if (url.startsWith("http")) {
+                // Remote URL
+                trackUri = Uri.parse(url);
+                Log.d(TAG, "🌐 Loading remote URL: " + url);
+            } else if (url.startsWith("file://")) {
+                // File URI - need to handle properly
+                try {
+                    // Remove "file://" prefix and handle the path
+                    String filePath = url.replace("file://", "");
+                    File file = new File(filePath);
+
+                    if (file.exists()) {
+                        trackUri = Uri.fromFile(file);
+                        Log.d(TAG, "📁 Loading local file: " + file.getAbsolutePath());
+                    } else {
+                        // Try alternative path handling
+                        trackUri = Uri.parse(url);
+                        Log.d(TAG, "⚠️ File not found, trying URI: " + url);
+                    }
+                } catch (Exception e) {
+                    Log.e(TAG, "❌ File path error, using URI directly", e);
+                    trackUri = Uri.parse(url);
+                }
+            } else if (url.startsWith("content://")) {
+                // Content URI
+                trackUri = Uri.parse(url);
+                Log.d(TAG, "📦 Loading content URI: " + url);
+            } else {
+                // Assume it's a local file path
+                File file = new File(url);
+                if (file.exists()) {
+                    trackUri = Uri.fromFile(file);
+                    Log.d(TAG, "📁 Loading local file path: " + file.getAbsolutePath());
+                } else {
+                    // Fallback to URI parsing
+                    trackUri = Uri.parse(url);
+                    Log.d(TAG, "⚠️ Using URI fallback: " + url);
+                }
+            }
+
+            Log.d(TAG, "🔗 Final URI: " + trackUri.toString());
 
             MediaItem mediaItem = MediaItem.fromUri(trackUri);
             exoPlayer.setMediaItem(mediaItem);
             exoPlayer.prepare();
-            exoPlayer.seekTo(currentPlaybackPosition);
+            exoPlayer.seekTo(0);
 
-            // CRITICAL: Update metadata for notification seekbar
-            updateMediaMetadata();
+            // Delay metadata update to ensure player is ready
+            mainHandler.postDelayed(() -> {
+                updateMediaMetadata();
+                updateMediaSessionPosition(0);
+            }, 100);
+
             notifyTrackChange(track);
             showNotification(track);
 
-            Log.d(TAG, "✅ Track loaded for notification seekbar");
-
         } catch (Exception e) {
-            Log.e(TAG, "❌ Load track failed", e);
-            notifyError("Load track failed: " + e.getMessage());
+            Log.e(TAG, "❌ Load failed: " + e.getMessage(), e);
+            notifyError("Load failed: " + e.getMessage() + " - URL: " + track.getUrl());
         }
     }
 
     private void handleTrackCompletion() {
-        if ("one".equals(repeatMode)) { exoPlayer.seekTo(0); exoPlayer.play(); }
-        else { currentIndex++; if (currentIndex >= trackQueue.size()) { if ("all".equals(repeatMode)) currentIndex = 0; else currentIndex = trackQueue.size() - 1; } loadCurrentTrack(); }
-        notifyListeners("playbackEnd", new JSObject());
+        if ("one".equals(repeatMode)) {
+            exoPlayer.seekTo(0);
+            exoPlayer.play();
+        } else {
+            notifyListeners("playbackEnd", new JSObject());
+        }
     }
 
-    @PluginMethod public void play(PluginCall call) { mainHandler.post(() -> { playInternal(); call.resolve(); }); }
-    @PluginMethod public void pause(PluginCall call) { mainHandler.post(() -> { pauseInternal(); call.resolve(); }); }
-    @PluginMethod public void stop(PluginCall call) { mainHandler.post(() -> { exoPlayer.stop(); stopPositionUpdates(); call.resolve(); }); }
-    @PluginMethod public void next(PluginCall call) { mainHandler.post(() -> { nextInternal(); call.resolve(); }); }
-    @PluginMethod public void previous(PluginCall call) { mainHandler.post(() -> { previousInternal(); call.resolve(); }); }
-    @PluginMethod public void seekTo(PluginCall call) {
+    @PluginMethod public void play(PluginCall call) {
+        mainHandler.post(() -> {
+            playInternal();
+            call.resolve();
+        });
+    }
+
+    @PluginMethod public void pause(PluginCall call) {
+        mainHandler.post(() -> {
+            pauseInternal();
+            call.resolve();
+        });
+    }
+
+    @PluginMethod public void stop(PluginCall call) {
+        mainHandler.post(() -> {
+            exoPlayer.stop();
+            stopPositionUpdates();
+            call.resolve();
+        });
+    }
+
+    @PluginMethod public void next(PluginCall call) {
+        mainHandler.post(() -> {
+            nextInternal();
+            call.resolve();
+        });
+    }
+
+    @PluginMethod public void previous(PluginCall call) {
+        mainHandler.post(() -> {
+            previousInternal();
+            call.resolve();
+        });
+    }
+
+    @PluginMethod
+    public void seekTo(PluginCall call) {
         mainHandler.post(() -> {
             Double pos = call.getDouble("position");
-            if (pos != null) exoPlayer.seekTo((long) (pos * 1000));
-            sendPlayerState();
+            if (pos != null && exoPlayer != null) {
+                long seekPosition = (long) (pos * 1000);
+                seekbarPosition = seekPosition;
+                exoPlayer.seekTo(seekPosition);
+                updateMediaSessionPosition(seekPosition);
+                sendPlayerState();
+            }
             call.resolve();
         });
     }
@@ -463,64 +497,67 @@ public class AudioPlayerPlugin extends Plugin {
         if (exoPlayer == null) return;
 
         Log.d(TAG, "▶️ Starting playback");
-
         exoPlayer.setPlayWhenReady(true);
-        if (!exoPlayer.isPlaying()) {
-            exoPlayer.play();
-        }
 
-        // Start position updates
         startPositionUpdates();
-
-        // Send initial state once
         sendPlayerState();
 
-        // Update notification once
-        showNotification(trackQueue.get(currentIndex));
+        if (!trackQueue.isEmpty()) {
+            showNotification(trackQueue.get(currentIndex));
+        }
     }
 
     private void pauseInternal() {
         if (exoPlayer == null) return;
-        if (exoPlayer.isPlaying()) exoPlayer.pause();
-        startPositionUpdates(); // still run to update seekbar
+
+        Log.d(TAG, "⏸️ Pausing playback");
+        exoPlayer.setPlayWhenReady(false);
+
+        // Don't stop updates completely, just let runnable handle slower updates
+        startPositionUpdates();
         sendPlayerState();
+
+        if (!trackQueue.isEmpty()) {
+            showNotification(trackQueue.get(currentIndex));
+        }
     }
 
     private void nextInternal() {
-        sendTrackActionToJS("next");
+        JSObject data = new JSObject();
+        data.put("action", "next");
+        notifyListeners("trackChange", data);
     }
 
     private void previousInternal() {
-        sendTrackActionToJS("previous");
-    }
-    private void startPositionUpdates() { positionHandler.removeCallbacks(positionRunnable); positionHandler.post(positionRunnable); }
-    private void stopPositionUpdates() { positionHandler.removeCallbacks(positionRunnable); }
-
-    private void sendTrackActionToJS(String action) {
         JSObject data = new JSObject();
-        data.put("action", action);
-        notifyListeners("trackChange", data); // fires your TS listener
+        data.put("action", "previous");
+        notifyListeners("trackChange", data);
+    }
+
+    private void startPositionUpdates() {
+        positionHandler.removeCallbacks(positionRunnable);
+        positionHandler.post(positionRunnable);
+    }
+
+    private void stopPositionUpdates() {
+        positionHandler.removeCallbacks(positionRunnable);
     }
 
     private void sendPlayerState() {
         if(trackQueue.isEmpty()) return;
+
         AudioTrack track = trackQueue.get(currentIndex);
         JSObject data = new JSObject();
 
-        long position = exoPlayer.getCurrentPosition(); // ms
-        long duration = exoPlayer.getDuration();        // ms
-
-        currentPlaybackPosition = position;
+        long position = exoPlayer.getCurrentPosition();
+        long duration = exoPlayer.getDuration();
 
         data.put("isPlaying", exoPlayer.isPlaying());
-        data.put("position", position / 1000.0);       // seconds
+        data.put("position", position / 1000.0);
         data.put("duration", duration > 0 ? duration / 1000.0 : 0);
         data.put("trackId", track.getId());
 
         notifyListeners("playerStateChange", data);
-
-        // Update MediaSession but NOT notification (to reduce conflicts)
-        updateMediaSessionPosition(position);
     }
 
     private void notifyTrackChange(AudioTrack track) {
@@ -545,7 +582,7 @@ public class AudioPlayerPlugin extends Plugin {
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
             NotificationChannel channel = new NotificationChannel(CHANNEL_ID, "Audio Player", NotificationManager.IMPORTANCE_LOW);
             NotificationManager manager = getContext().getSystemService(NotificationManager.class);
-            if(manager!=null) manager.createNotificationChannel(channel);
+            if(manager != null) manager.createNotificationChannel(channel);
         }
     }
 
@@ -557,16 +594,14 @@ public class AudioPlayerPlugin extends Plugin {
         long positionMs = exoPlayer.getCurrentPosition();
         long durationMs = exoPlayer.getDuration();
 
-        // Convert to seconds for display
         int positionSec = (int) (positionMs / 1000);
         int durationSec = durationMs > 0 ? (int) (durationMs / 1000) : 0;
 
         String positionText = String.format("%02d:%02d", positionSec / 60, positionSec % 60);
         String durationText = durationSec > 0 ? String.format("%02d:%02d", durationSec / 60, durationSec % 60) : "--:--";
 
-        Log.d(TAG, "📱 Building Notification: " + positionText + " / " + durationText);
+        Log.d(TAG, "📱 Notification: " + (isPlaying ? "PLAYING" : "PAUSED") + " - " + positionText + "/" + durationText);
 
-        // Create pending intents with DIFFERENT request codes
         PendingIntent playPauseIntent = PendingIntent.getBroadcast(context, 100,
                 new Intent(context, AudioPlayerReceiver.class)
                         .setAction(isPlaying ? "ACTION_PAUSE" : "ACTION_PLAY"),
@@ -580,13 +615,11 @@ public class AudioPlayerPlugin extends Plugin {
                 new Intent(context, AudioPlayerReceiver.class).setAction("ACTION_PREV"),
                 PendingIntent.FLAG_UPDATE_CURRENT | PendingIntent.FLAG_IMMUTABLE);
 
-        // Create content intent
         Intent contentIntent = new Intent(context, getActivity().getClass());
         contentIntent.setFlags(Intent.FLAG_ACTIVITY_CLEAR_TOP | Intent.FLAG_ACTIVITY_SINGLE_TOP);
         PendingIntent contentPendingIntent = PendingIntent.getActivity(context, 400, contentIntent,
                 PendingIntent.FLAG_UPDATE_CURRENT | PendingIntent.FLAG_IMMUTABLE);
 
-        // SIMPLE notification without MediaStyle
         NotificationCompat.Builder builder = new NotificationCompat.Builder(context, CHANNEL_ID)
                 .setContentTitle(track.getTitle())
                 .setContentText(track.getArtist() + " • " + positionText + "/" + durationText)
@@ -602,17 +635,14 @@ public class AudioPlayerPlugin extends Plugin {
                 .setOnlyAlertOnce(true)
                 .setAutoCancel(false);
 
-        // MANUAL PROGRESS BAR - This is what will show the moving progress
-        if (durationMs > 0 && positionMs <= durationMs) {
-            builder.setProgress((int) durationMs, (int) positionMs, false);
-            Log.d(TAG, "✅ Setting manual progress: " + positionMs + "/" + durationMs);
-        } else {
-            // Show indeterminate progress if duration not available
-            builder.setProgress(0, 0, true);
-            Log.d(TAG, "⏳ Showing indeterminate progress");
-        }
+        // Use MediaStyle for interactive seekbar
+        MediaStyle style = new MediaStyle();
+        style.setMediaSession(mediaSession.getSessionToken());
+        style.setShowActionsInCompactView(0, 1, 2);
+        builder.setStyle(style);
 
-        // Set large icon
+        // REMOVED: Manual progress bar - MediaSession handles seekbar
+
         if (track.getArtwork() != null && !track.getArtwork().isEmpty()) {
             try {
                 new Thread(() -> {
@@ -625,22 +655,18 @@ public class AudioPlayerPlugin extends Plugin {
                         NotificationManager manager = (NotificationManager) context.getSystemService(Context.NOTIFICATION_SERVICE);
                         if (manager != null) {
                             manager.notify(NOTIFICATION_ID, builder.build());
-                            Log.d(TAG, "✅ Notification updated with artwork");
                         }
-
                         input.close();
                     } catch (Exception e) {
-                        Log.e(TAG, "Error loading artwork", e);
                         showNotificationWithoutArtwork(builder, context);
                     }
                 }).start();
                 return;
             } catch (Exception e) {
-                Log.e(TAG, "Error setting up artwork load", e);
+                // Continue without artwork
             }
         }
 
-        // Show without artwork
         showNotificationWithoutArtwork(builder, context);
     }
 
@@ -648,61 +674,7 @@ public class AudioPlayerPlugin extends Plugin {
         NotificationManager manager = (NotificationManager) context.getSystemService(Context.NOTIFICATION_SERVICE);
         if (manager != null) {
             manager.notify(NOTIFICATION_ID, builder.build());
-            Log.d(TAG, "✅ Notification updated successfully");
-        } else {
-            Log.e(TAG, "❌ NotificationManager is null");
         }
-    }
-
-    @PluginMethod
-    public void testNotification(PluginCall call) {
-        mainHandler.post(() -> {
-            if (!trackQueue.isEmpty() && currentIndex < trackQueue.size()) {
-                Log.d(TAG, "🧪 TESTING NOTIFICATION DIRECTLY");
-
-                // Force update notification
-                showNotification(trackQueue.get(currentIndex));
-
-                // Get current position
-                long position = exoPlayer != null ? exoPlayer.getCurrentPosition() : 0;
-                long duration = exoPlayer != null ? exoPlayer.getDuration() : 0;
-
-                JSObject result = new JSObject();
-                result.put("position", position);
-                result.put("duration", duration);
-                result.put("positionSeconds", position / 1000);
-                result.put("durationSeconds", duration / 1000);
-
-                call.resolve(result);
-            } else {
-                call.reject("No track loaded");
-            }
-        });
-    }
-
-    private PendingIntent createStopPendingIntent(Context context) {
-        return PendingIntent.getBroadcast(context, 4,
-                new Intent(context, AudioPlayerReceiver.class).setAction("ACTION_STOP"),
-                PendingIntent.FLAG_UPDATE_CURRENT | PendingIntent.FLAG_IMMUTABLE);
-    }
-
-    @PluginMethod
-    public void setPlaybackRate(PluginCall call) {
-        Double rate = call.getDouble("rate");
-        if (rate == null) {
-            call.reject("Playback rate not provided");
-            return;
-        }
-
-        mainHandler.post(() -> {
-            if (exoPlayer != null) {
-                float playbackSpeed = rate.floatValue();
-                exoPlayer.setPlaybackSpeed(playbackSpeed);
-                Log.d(TAG, "Playback rate set to: " + playbackSpeed);
-                sendPlayerState(); // optional: update UI
-            }
-            call.resolve();
-        });
     }
 
     public static class AudioPlayerReceiver extends BroadcastReceiver {
@@ -714,31 +686,20 @@ public class AudioPlayerPlugin extends Plugin {
             String action = intent.getAction();
             if (action == null) return;
 
-            Log.d("AudioPlayerReceiver", "Notification Action: " + action);
-
             switch (action) {
                 case "ACTION_PLAY":
-                    Log.d("AudioPlayerReceiver", "▶️ Play button pressed");
                     plugin.playInternal();
                     break;
-
                 case "ACTION_PAUSE":
-                    Log.d("AudioPlayerReceiver", "⏸️ Pause button pressed");
                     plugin.pauseInternal();
                     break;
-
                 case "ACTION_NEXT":
-                    Log.d("AudioPlayerReceiver", "⏭️ Next button pressed");
                     plugin.nextInternal();
                     break;
-
                 case "ACTION_PREV":
-                    Log.d("AudioPlayerReceiver", "⏮️ Previous button pressed");
                     plugin.previousInternal();
                     break;
-
                 case "ACTION_STOP":
-                    Log.d("AudioPlayerReceiver", "⏹️ Stop button pressed");
                     if (plugin.exoPlayer != null) {
                         plugin.exoPlayer.stop();
                         plugin.stopPositionUpdates();
@@ -746,46 +707,6 @@ public class AudioPlayerPlugin extends Plugin {
                     break;
             }
         }
-    }
-
-    @PluginMethod
-    public void debugPlayer(PluginCall call) {
-        mainHandler.post(() -> {
-            JSObject result = new JSObject();
-            if (exoPlayer != null) {
-                result.put("playbackState", exoPlayer.getPlaybackState());
-                result.put("isPlaying", exoPlayer.isPlaying());
-                result.put("currentPosition", exoPlayer.getCurrentPosition());
-                result.put("duration", exoPlayer.getDuration());
-                result.put("trackCount", trackQueue.size());
-                result.put("currentIndex", currentIndex);
-                result.put("playWhenReady", exoPlayer.getPlayWhenReady());
-
-                String stateName;
-                switch (exoPlayer.getPlaybackState()) {
-                    case Player.STATE_IDLE: stateName = "IDLE"; break;
-                    case Player.STATE_BUFFERING: stateName = "BUFFERING"; break;
-                    case Player.STATE_READY: stateName = "READY"; break;
-                    case Player.STATE_ENDED: stateName = "ENDED"; break;
-                    default: stateName = "UNKNOWN";
-                }
-                result.put("playbackStateName", stateName);
-
-                Log.d(TAG, "=== DEBUG PLAYER ===");
-                Log.d(TAG, "State: " + stateName);
-                Log.d(TAG, "isPlaying: " + exoPlayer.isPlaying());
-                Log.d(TAG, "playWhenReady: " + exoPlayer.getPlayWhenReady());
-                Log.d(TAG, "Position: " + exoPlayer.getCurrentPosition() + "ms");
-                Log.d(TAG, "Duration: " + exoPlayer.getDuration() + "ms");
-                Log.d(TAG, "Track count: " + trackQueue.size());
-                Log.d(TAG, "Current index: " + currentIndex);
-                Log.d(TAG, "=== END DEBUG ===");
-
-            } else {
-                result.put("error", "Player is null");
-            }
-            call.resolve(result);
-        });
     }
 
     // Helper to get plugin instance

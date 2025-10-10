@@ -195,6 +195,7 @@ public class AudioPlayerPlugin: CAPPlugin {
         guard currentIndex >= 0 && currentIndex < trackQueue.count else { return }
         
         let track = trackQueue[currentIndex]
+        print("🎵 Loading track: \(track.title) - URL: \(track.url)")
         
         // Clean up existing players & observers
         cleanupStateUpdates()
@@ -238,17 +239,71 @@ public class AudioPlayerPlugin: CAPPlugin {
                 }
                 
             } else {
-                // Local file: Use AVAudioPlayer
-                let url = URL(fileURLWithPath: track.url)
-                audioPlayer = try AVAudioPlayer(contentsOf: url)
+                // Local file: Use AVAudioPlayer - FIXED WITH documents:// SUPPORT
+                var fileURL: URL
+                
+                if track.url.hasPrefix("documents://") {
+                    // FIX: Handle documents:// URLs (like documents://87810/18gg250603.mp3)
+                    let documentsPath = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask)[0]
+                    let relativePath = track.url.replacingOccurrences(of: "documents://", with: "")
+                    fileURL = documentsPath.appendingPathComponent(relativePath)
+                    print("🎵 Converted documents:// to: \(fileURL.path)")
+                } else if track.url.hasPrefix("file://") {
+                    // Handle file:// URLs (like file:///var/mobile/Containers/...)
+                    guard let url = URL(string: track.url) else {
+                        throw NSError(domain: "AudioPlayerPlugin", code: -4, userInfo: [NSLocalizedDescriptionKey: "Invalid file URL"])
+                    }
+                    fileURL = url
+                } else if track.url.hasPrefix("/") {
+                    // Absolute file path
+                    fileURL = URL(fileURLWithPath: track.url)
+                } else {
+                    // Relative path - try to find in documents directory
+                    let documentsPath = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask)[0]
+                    fileURL = documentsPath.appendingPathComponent(track.url)
+                }
+                
+                // Check if file exists
+                if !FileManager.default.fileExists(atPath: fileURL.path) {
+                    // Try fallback - check if file exists in temp directory
+                    let tempPath = NSTemporaryDirectory()
+                    let fileName = (track.url as NSString).lastPathComponent
+                    let fallbackURL = URL(fileURLWithPath: tempPath).appendingPathComponent(fileName)
+                    
+                    if FileManager.default.fileExists(atPath: fallbackURL.path) {
+                        print("🎵 Found file in temp directory: \(fallbackURL.path)")
+                        fileURL = fallbackURL
+                    } else {
+                        throw NSError(domain: "AudioPlayerPlugin", code: -5, userInfo: [
+                            NSLocalizedDescriptionKey: "File not found",
+                            "originalPath": track.url,
+                            "resolvedPath": fileURL.path,
+                            "fallbackPath": fallbackURL.path
+                        ])
+                    }
+                }
+                
+                print("🎵 Loading local file: \(fileURL.path)")
+                
+                // Create and configure audio player
+                audioPlayer = try AVAudioPlayer(contentsOf: fileURL)
                 audioPlayer?.delegate = self
                 audioPlayer?.enableRate = true
-                audioPlayer?.prepareToPlay()
-                audioPlayer?.play()
                 
-                setupPeriodicStateUpdates()
-                updateNowPlayingInfo()
-                notifyTrackChange(track: track)
+                // Prepare to play
+                if audioPlayer?.prepareToPlay() == false {
+                    throw NSError(domain: "AudioPlayerPlugin", code: -6, userInfo: [NSLocalizedDescriptionKey: "Failed to prepare audio file"])
+                }
+                
+                // Play the audio
+                if audioPlayer?.play() == true {
+                    print("🎵 Local track playing successfully")
+                    setupPeriodicStateUpdates()
+                    updateNowPlayingInfo()
+                    notifyTrackChange(track: track)
+                } else {
+                    throw NSError(domain: "AudioPlayerPlugin", code: -7, userInfo: [NSLocalizedDescriptionKey: "Failed to play audio file"])
+                }
             }
             
             lastErrorMessage = nil
